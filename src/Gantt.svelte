@@ -18,10 +18,10 @@
     import { getRelativePos, isLeftClick } from './utils/dom';
     import { GanttApi } from './core/api';
     import { TaskFactory, reflectTask } from './core/task';
-    import type { SvelteTask } from './core/task';
+    import type { SvelteTask, TaskModel } from './core/task';
     import { RowFactory } from './core/row';
     import { TimeRangeFactory } from './core/timeRange';
-    import { DragDropManager } from './core/drag';
+    import { DragDropManager, DragContextProvider } from './core/drag';
     import { SelectionManager } from './core/selectionManager';
     import { findByPosition, findByDate } from './core/column';
     import type { HighlightedDurations, Column as IColumn } from './core/column';
@@ -40,7 +40,7 @@
     }
 
     export let rows;
-    export let tasks = [];
+    export let tasks: TaskModel[] = [];
     export let timeRanges = [];
 
     assertSet({ rows });
@@ -144,6 +144,8 @@
 
     /** Controls how the tasks will render */
     export let layout: 'overlap' | 'pack' = 'overlap';
+    const _layout = writable(layout);
+    $: $_layout = layout;
 
     const visibleWidth = writable<number>(null);
     const visibleHeight = writable<number>(null);
@@ -273,6 +275,7 @@
         taskContent,
         rowPadding: _rowPadding,
         rowHeight: _rowHeight,
+        layout: _layout,
         resizeHandleWidth: resizeHandleWidth,
         reflectOnParentRows,
         reflectOnChildRows,
@@ -307,23 +310,24 @@
         api.registerEvent('tasks', 'dblclicked');
         api.registerEvent('timeranges', 'clicked');
         api.registerEvent('timeranges', 'resized');
+        api.registerEvent('timeranges', 'changed');
 
         mounted = true;
     });
 
     const { onDelegatedEvent, offDelegatedEvent, onEvent } = createDelegatedEventDispatcher();
 
-    onDelegatedEvent('mousedown', 'data-task-id', (event, data, target) => {
+    onDelegatedEvent('click', 'data-task-id', (event, data, target) => {
         const taskId = data;
-        if (isLeftClick(event) && !target.classList.contains('sg-task-reflected')) {
+        const task = $taskStore.entities[taskId];
+        if (isLeftClick(event) && !target.classList.contains('sg-task-reflected') && !target.classList.contains('sg-ignore-click')) {
             if (event.ctrlKey) {
-                selectionManager.toggleSelection(taskId, target);
+                selectionManager.toggleSelection(taskId);
             } else {
-                selectionManager.selectSingle(taskId, target);
+                selectionManager.selectSingle(taskId);
             }
-            selectionManager.dispatchSelectionEvent(taskId, event);
         }
-        api['tasks'].raise.select($taskStore.entities[taskId]);
+        api['tasks'].raise.select(task);
     });
 
     onDelegatedEvent('mouseover', 'data-row-id', (event, data, target) => {
@@ -448,41 +452,53 @@
         rowStore.addAll(rows);
     }
 
-    async function initTasks(taskData) {
+    async function initTasks(taskData: TaskModel[]) {
         // because otherwise we need to use tick() which will update other things
         taskFactory.rowEntities = $rowStore.entities;
 
         const tasks = [];
-        const opts = { rowPadding: $_rowPadding };
         const draggingTasks = {};
-        taskData.forEach(t => {
-            if ($draggingTaskCache[t.id]) {
-                draggingTasks[t.id] = true;
+        for (const taskModel of taskData) {
+            if ($draggingTaskCache[taskModel.id]) {
+                draggingTasks[taskModel.id] = true;
             }
-            const task = taskFactory.createTask(t);
+            const task = taskFactory.createTask(taskModel);
+            tasks.push(task);
+        }
+        $draggingTaskCache = draggingTasks;
+        taskStore.addAll(tasks);
+    }
+
+    let _reflectedTasksCache: { [rowId: string]: SvelteTask[] } = {};
+    $: {
+        _reflectedTasksCache = {};
+        const opts = { rowPadding: $_rowPadding };
+        for (const task of $allTasks) {
             const row = $rowStore.entities[task.model.resourceId];
-            task.reflections = [];
+            if (!row) {
+                continue;
+            }
 
             if (reflectOnChildRows && row.allChildren) {
                 row.allChildren.forEach(r => {
                     const reflectedTask = reflectTask(task, r, opts);
-                    task.reflections.push(reflectedTask.model.id);
-                    tasks.push(reflectedTask);
+                    if (!_reflectedTasksCache[r.model.id]) {
+                        _reflectedTasksCache[r.model.id] = [];
+                    }
+                    _reflectedTasksCache[r.model.id].push(reflectedTask);
                 });
             }
 
-            if (reflectOnParentRows && row.allParents.length > 0) {
+            if (reflectOnParentRows && row.allParents) {
                 row.allParents.forEach(r => {
                     const reflectedTask = reflectTask(task, r, opts);
-                    task.reflections.push(reflectedTask.model.id);
-                    tasks.push(reflectedTask);
+                    if (!_reflectedTasksCache[r.model.id]) {
+                        _reflectedTasksCache[r.model.id] = [];
+                    }
+                    _reflectedTasksCache[r.model.id].push(reflectedTask);
                 });
             }
-
-            tasks.push(task);
-        });
-        $draggingTaskCache = draggingTasks;
-        taskStore.addAll(tasks);
+        }
     }
 
     function initTimeRanges(timeRangeData) {
@@ -562,7 +578,7 @@
     export function selectTask(id) {
         const task = $taskStore.entities[id];
         if (task) {
-            selectionManager.selectSingle(id, ganttElement.querySelector(`data-task-id='${id}'`)); // TODO:: fix
+            selectionManager.selectSingle(id);
         }
     }
 
@@ -709,6 +725,10 @@
                     rendered[id] = true;
                 }
             }
+
+            if (_reflectedTasksCache[row.model.id]) {
+                tasks.push(..._reflectedTasksCache[row.model.id]);
+            }
         }
         
         // render all tasks being dragged if not already
@@ -740,102 +760,105 @@
 
 <!-- svelte-ignore a11y-click-events-have-key-events -->
 <!-- svelte-ignore a11y-mouse-events-have-key-events -->
-<div
-    class="sg-gantt {classes}"
-    class:sg-disable-transition={disableTransition}
-    bind:this={ganttElement}
-    on:mousedown|stopPropagation={onEvent}
-    on:click|stopPropagation={onEvent}
-    on:dblclick={onEvent}
-    on:mouseover={onEvent}
-    on:mouseleave={onEvent}
->
-    {#each ganttTableModules as module}
-        <svelte:component
-            this={module}
-            {rowContainerHeight}
-            {paddingTop}
-            {paddingBottom}
-            {tableWidth}
-            {...$$restProps}
-            on:init={onModuleInit}
-            {visibleRows}
-        />
+<DragContextProvider>
+    <!-- svelte-ignore a11y-no-static-element-interactions -->
+    <div
+        class="sg-gantt {classes}"
+        class:sg-disable-transition={disableTransition}
+        bind:this={ganttElement}
+        on:mousedown|stopPropagation={onEvent}
+        on:click|stopPropagation={onEvent}
+        on:dblclick={onEvent}
+        on:mouseover={onEvent}
+        on:mouseleave={onEvent}
+    >
+        {#each ganttTableModules as module}
+            <svelte:component
+                this={module}
+                {rowContainerHeight}
+                {paddingTop}
+                {paddingBottom}
+                {tableWidth}
+                {...$$restProps}
+                on:init={onModuleInit}
+                {visibleRows}
+            />
 
-        <Resizer x={tableWidth} on:resize={onResize} container={ganttElement}></Resizer>
-    {/each}
+            <Resizer x={tableWidth} on:resize={onResize} container={ganttElement}></Resizer>
+        {/each}
 
-    <div class="sg-timeline sg-view">
-        <div class="sg-header" bind:this={mainHeaderContainer} bind:clientHeight={$headerHeight} class:right-scrollbar-visible="{rightScrollbarVisible}">
-            <div class="sg-header-scroller" use:horizontalScrollListener>
-                <div class="header-container" style="width:{$_width}px">
-                    <ColumnHeader
-                        {headers}
-                        ganttBodyColumns={columns}
-                        ganttBodyUnit={columnUnit}
-                        on:dateSelected={onDateSelected}
-                    />
-                    {#each $allTimeRanges as timeRange (timeRange.model.id)}
-                        <TimeRangeHeader {...timeRange} />
-                    {/each}
-                </div>
-            </div>
-        </div>
-
-        <div
-            class="sg-timeline-body"
-            bind:this={mainContainer}
-            use:scrollable
-            class:zooming
-            on:wheel={onwheel}
-            bind:clientHeight={$visibleHeight}
-            bind:clientWidth={$visibleWidth}
-        >
-            <div class="content" style="width:{$_width}px">
-                <Columns {columns} {columnStrokeColor} {columnStrokeWidth} {useCanvasColumns} />
-
-                <div
-                    class="sg-rows"
-                    bind:this={rowContainer}
-                    style="height:{rowContainerHeight}px;"
-                >
-                    <div style="transform: translateY({paddingTop}px);">
-                        {#each visibleRows as row (row.model.id)}
-                            <Row {row} />
+        <div class="sg-timeline sg-view">
+            <div class="sg-header" bind:this={mainHeaderContainer} bind:clientHeight={$headerHeight} class:right-scrollbar-visible="{rightScrollbarVisible}">
+                <div class="sg-header-scroller" use:horizontalScrollListener>
+                    <div class="header-container" style="width:{$_width}px">
+                        <ColumnHeader
+                            {headers}
+                            ganttBodyColumns={columns}
+                            ganttBodyUnit={columnUnit}
+                            on:dateSelected={onDateSelected}
+                        />
+                        {#each $allTimeRanges as timeRange (timeRange.model.id)}
+                            <TimeRangeHeader {...timeRange} />
                         {/each}
                     </div>
                 </div>
+            </div>
 
-                <div class="sg-foreground">
-                    {#each $allTimeRanges as timeRange (timeRange.model.id)}
-                        <TimeRange {...timeRange} />
-                    {/each}
+            <div
+                class="sg-timeline-body"
+                bind:this={mainContainer}
+                use:scrollable
+                class:zooming
+                on:wheel={onwheel}
+                bind:clientHeight={$visibleHeight}
+                bind:clientWidth={$visibleWidth}
+            >
+                <div class="content" style="width:{$_width}px">
+                    <Columns {columns} {columnStrokeColor} {columnStrokeWidth} {useCanvasColumns} />
 
-                    {#each visibleTasks as task (task.model.id)}
-                        <Task
-                            model={task.model}
-                            left={task.left}
-                            width={task.width}
-                            height={task.height}
-                            top={task.top}
-                            {...task}
+                    <div
+                        class="sg-rows"
+                        bind:this={rowContainer}
+                        style="height:{rowContainerHeight}px;"
+                    >
+                        <div style="transform: translateY({paddingTop}px);">
+                            {#each visibleRows as row (row.model.id)}
+                                <Row {row} />
+                            {/each}
+                        </div>
+                    </div>
+
+                    <div class="sg-foreground">
+                        {#each $allTimeRanges as timeRange (timeRange.model.id)}
+                            <TimeRange {...timeRange} />
+                        {/each}
+
+                        {#each visibleTasks as task (task.model.id)}
+                            <Task
+                                model={task.model}
+                                left={task.left}
+                                width={task.width}
+                                height={task.height}
+                                top={task.top}
+                                {...task}
+                            />
+                        {/each}
+                    </div>
+                    {#each ganttBodyModules as module}
+                        <svelte:component
+                            this={module}
+                            {paddingTop}
+                            {paddingBottom}
+                            {visibleRows}
+                            {...$$restProps}
+                            on:init={onModuleInit}
                         />
                     {/each}
                 </div>
-                {#each ganttBodyModules as module}
-                    <svelte:component
-                        this={module}
-                        {paddingTop}
-                        {paddingBottom}
-                        {visibleRows}
-                        {...$$restProps}
-                        on:init={onModuleInit}
-                    />
-                {/each}
             </div>
         </div>
     </div>
-</div>
+</DragContextProvider>
 
 <style>
     .sg-disable-transition :global(.sg-task),

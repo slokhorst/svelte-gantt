@@ -4,6 +4,7 @@ export interface RowModel {
     classes?: string | string[];
     contentHtml?: string;
     enableDragging?: boolean;
+    enableResize?: boolean;
     height: number;
     /** Child rows in expandable tree */
     children?: RowModel[];
@@ -27,7 +28,6 @@ export interface SvelteRow {
     parent?: SvelteRow;
     allParents?: SvelteRow[];
     childLevel?: number;
-    entities?: any;
 }
 
 export class RowFactory {
@@ -45,6 +45,7 @@ export class RowFactory {
         row.contentHtml = row.contentHtml || undefined;
         // enable dragging of tasks to and from this row
         row.enableDragging = row.enableDragging === undefined ? true : row.enableDragging;
+        row.enableResize = row.enableResize === undefined ? true : row.enableResize;
         // height of row element
         const height = row.height || this.rowHeight;
 
@@ -85,10 +86,13 @@ export class RowFactory {
             row.parent = parent;
             row.allParents = parents;
             if (parent) {
+                // when row is hidden, other rows (y-pos) move upward
                 row.hidden = !(parent.model.expanded || parent.model.expanded == null);
             }
 
-            ctx.y += row.height;
+            if (!row.hidden) {
+                ctx.y += row.height;
+            }
 
             if (rowModel.children) {
                 const nextLevel = this.createChildRows(

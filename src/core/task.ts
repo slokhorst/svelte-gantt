@@ -15,6 +15,7 @@ export interface TaskModel {
     buttonClasses?: string | string[];
     buttonHtml?: string;
     enableDragging?: boolean;
+    enableResize?: boolean;
     labelBottom?: string;
     type?: 'milestone' | 'task';
     stickyLabel?: boolean;
@@ -28,7 +29,12 @@ export interface SvelteTask {
     width: number;
 
     height: number;
-    reflections?: string[];
+
+    /* tree fields */
+    reflected?: boolean;
+    reflectedOnParent?: boolean;
+    reflectedOnChild?: boolean;
+    originalId?: number;
     
     /* pack layout fields */
     intersectsWith?: SvelteTask[];
@@ -70,6 +76,7 @@ export class TaskFactory {
         model.buttonHtml = model.buttonHtml || '';
         // enable dragging of task
         model.enableDragging = model.enableDragging === undefined ? true : model.enableDragging;
+        model.enableResize = model.enableResize === undefined ? true : model.enableResize;
 
         const left = this.columnService.getPositionByDate(model.from) | 0;
         const right = this.columnService.getPositionByDate(model.to) | 0;
@@ -80,7 +87,6 @@ export class TaskFactory {
             width: right - left,
             height: this.getHeight(model),
             top: this.getPosY(model),
-            reflections: []
         };
     }
 
@@ -93,11 +99,13 @@ export class TaskFactory {
     }
 
     getHeight(model) {
-        return this.row(model.resourceId).height - 2 * this.rowPadding;
+        const row = this.row(model.resourceId);
+        return (row ? row.height : undefined) - 2 * this.rowPadding;
     }
 
     getPosY(model) {
-        return this.row(model.resourceId).y + this.rowPadding;
+        const row = this.row(model.resourceId);
+        return (row ? row.y : -1000) + this.rowPadding;
     }
 }
 
@@ -105,13 +113,13 @@ export function overlap(one: SvelteTask, other: SvelteTask) {
     return !(one.left + one.width <= other.left || one.left >= other.left + other.width);
 }
 
-export function reflectTask(task: SvelteTask, row: SvelteRow, options: { rowPadding: number }) {
+export function reflectTask(task: SvelteTask, row: SvelteRow, options: { rowPadding: number }): SvelteTask {
     const reflectedId = `reflected-task-${task.model.id}-${row.model.id}`;
 
     const model = {
         ...task.model,
         resourceId: row.model.id,
-        id: reflectedId,
+        id: reflectedId as any,
         enableDragging: false
     };
 

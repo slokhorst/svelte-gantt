@@ -1,9 +1,8 @@
 <script lang="ts">
     import { getContext } from 'svelte';
-    import { TaskModel, reflectTask } from '../core/task';
+    import { TaskModel, SvelteTask } from '../core/task';
     import { normalizeClassAttr, setCursor, throttle } from '../utils/dom';
-    import type { GanttContext, GanttContextOptions, GanttContextServices } from '../gantt';
-    import type { GanttDataStore } from '../core/store';
+    import { DownDropEvent, useDraggable } from '../core/drag';
 
     export let model: TaskModel;
     export let height: number;
@@ -23,7 +22,10 @@
         width: width
     };
 
-    $: updatePosition(left, top + topDelta, width);
+    $: {
+        updatePosition(left, top + topDelta, width);
+    }
+
     function updatePosition(x, y, width) {
         if (!_dragging && !_resizing) {
             _position.x = x;
@@ -33,21 +35,22 @@
         }
     }
 
-    const { taskStore, rowStore, draggingTaskCache } = getContext('dataStore') as GanttDataStore;
-    const { rowContainer, mainContainer }: GanttContext = getContext('gantt');
+    const { taskStore, rowStore, draggingTaskCache } = getContext('dataStore');
+    const { rowContainer, mainContainer } = getContext('gantt');
     const {
         taskContent,
         resizeHandleWidth,
         rowPadding,
         onTaskButtonClick,
-        reflectOnParentRows,
-        reflectOnChildRows,
-        taskElementHook
-    }: GanttContextOptions = getContext('options');
-    const { dndManager, api, utils, columnService, selectionManager }: GanttContextServices =
-        getContext('services');
+        taskElementHook,
+        layout
+    } = getContext('options');
+    const { dndManager, api, utils, columnService, selectionManager } = getContext('services');
 
-    let selectedTasks = selectionManager.selectedTasks;
+    const draggingContext = getContext('drag');
+    let draggingActive = draggingContext.active;
+
+    let selectedTasks = selectionManager._selectedTasks;
 
     /** How much pixels near the bounds user has to drag to start scrolling */
     const DRAGGING_TO_SCROLL_TRESHOLD = 40;
@@ -88,14 +91,33 @@
         }
     }, 250);
 
-    function drag(_: HTMLElement) {
-        function onDrop(event) {
+    let _ignoreClick = false;
+    function drag(node: HTMLElement) {
+        // reflected tasks must not be resized or dragged
+        if (reflected) {
+            return;
+        }
+
+        draggingContext.on(model.id, {
+            move(event) {
+                _position = {
+                    x: event.x != null ? event.x : _position.x,
+                    y: event.y != null ? event.y : _position.y,
+                    width: event.width != null ? event.width : _position.width,
+                };
+            },
+            drop(event) {
+                onDrop(event);
+            }
+        });
+
+        function onDrop(event: DownDropEvent) {
             let rowChangeValid = true;
             const previousState = {
                 id: model.id,
                 resourceId: model.resourceId,
                 from: model.from,
-                to: model.to,
+                to: model.to
             };
 
             //row switching
@@ -111,147 +133,128 @@
             }
 
             _dragging = _resizing = false;
+            setTimeout(() => { // because we want to block delegated clicks on gantt after dragging
+                _ignoreClick = false;
+            });
 
             const task = $taskStore.entities[model.id];
             delete $draggingTaskCache[model.id];
 
-            if (rowChangeValid) {
-                const prevFrom = model.from;
-                const prevTo = model.to;
-                const newFrom = (model.from = utils.roundTo(
-                    columnService.getDateByPosition(event.x)
-                ));
-                const newTo = (model.to = utils.roundTo(
-                    columnService.getDateByPosition(event.x + event.width)
-                ));
-                const newLeft = columnService.getPositionByDate(newFrom) | 0;
-                const newRight = columnService.getPositionByDate(newTo) | 0;
-
-                const targetRow = $rowStore.entities[model.resourceId];
-                const left = newLeft;
-                const width = newRight - newLeft;
-                const top = $rowPadding + targetRow.y;
-
-                updatePosition(left, top + topDelta, width);
-
-                const newTask = {
-                    ...task,
-                    left: left,
-                    width: width,
-                    top: top,
-                    model
-                };
-
-                const changed =
-                    prevFrom != newFrom ||
-                    prevTo != newTo ||
-                    (sourceRow && sourceRow.model.id !== targetRow.model.id);
-                if (changed) {
-                    api.tasks.raise.change({ task: newTask, sourceRow, targetRow, previousState });
-                }
-                selectionManager.newTasksAndReflections.push(newTask);
-
-                if (changed) {
-                    api.tasks.raise.changed({ task: newTask, sourceRow, targetRow, previousState });
-                }
-
-                // update shadow tasks
-                if (newTask.reflections) {
-                    selectionManager.oldReflections.push(...newTask.reflections);
-                }
-
-                const reflectedTasks = [];
-                if (reflectOnChildRows && targetRow.allChildren) {
-                    if (!newTask.reflections) newTask.reflections = [];
-
-                    const opts = { rowPadding: $rowPadding };
-                    targetRow.allChildren.forEach(r => {
-                        const reflectedTask = reflectTask(newTask, r, opts);
-                        newTask.reflections.push(reflectedTask.model.id);
-                        reflectedTasks.push(reflectedTask);
-                    });
-                }
-
-                if (reflectOnParentRows && targetRow.allParents.length > 0) {
-                    if (!newTask.reflections) newTask.reflections = [];
-
-                    const opts = { rowPadding: $rowPadding };
-                    targetRow.allParents.forEach(r => {
-                        const reflectedTask = reflectTask(newTask, r, opts);
-                        newTask.reflections.push(reflectedTask.model.id);
-                        reflectedTasks.push(reflectedTask);
-                    });
-                }
-
-                if (reflectedTasks.length > 0) {
-                    selectionManager.newTasksAndReflections.push(...reflectedTasks);
-                }
-
-                if (!(targetRow.allParents.length > 0) && !targetRow.allChildren) {
-                    newTask.reflections = null;
-                }
-            } else {
+            if (!rowChangeValid) {
                 // reset position
-                (_position.x = task.left), (_position.width = task.width), (_position.y = task.top);
+                _position.x = task.left;
+                _position.width = task.width;
+                _position.y = task.top;
+                return;
             }
-        }
 
-        if (!reflected) {
-            // reflected tasks must not be resized or dragged
-            selectionManager.taskSettings.set(model.id.toString(), {
-                onDown: event => {
-                    mainContainerRect = mainContainer.getBoundingClientRect();
-                    if (event.dragging) {
-                        setCursor('move');
-                    }
-                    if (event.resizing) {
-                        setCursor('e-resize');
-                    }
-                    $draggingTaskCache[model.id] = true;
-                },
-                onMouseUp: () => {
-                    setCursor('default');
-                    api.tasks.raise.moveEnd(model);
-                },
-                onResize: event => {
-                    _position.x = event.x;
-                    _position.width = event.width;
-                    _resizing = true;
-                    scrollIfOutOfBounds(event.event);
-                },
-                onDrag: event => {
-                    _position.x = event.x;
-                    _position.y = event.y;
-                    _dragging = true;
-                    api.tasks.raise.move(model);
-                    scrollIfOutOfBounds(event.event);
-                },
-                dragAllowed: () => {
-                    return (
-                        $rowStore.entities[model.resourceId].model.enableDragging &&
-                        model.enableDragging
-                    );
-                },
-                resizeAllowed: () => {
-                    return (
-                        model.type !== 'milestone' &&
-                        $rowStore.entities[model.resourceId].model.enableDragging &&
-                        model.enableDragging
-                    );
-                },
-                onDrop: onDrop,
-                container: rowContainer,
-                resizeHandleWidth,
-                getX: () => _position.x,
-                getY: () => _position.y,
-                getWidth: () => _position.width,
-                modelId: model.id
-            });
+            const prevFrom = model.from;
+            const prevTo = model.to;
+            const newFrom = (model.from = utils.roundTo(columnService.getDateByPosition(event.x)));
+            const newTo = (model.to = utils.roundTo(columnService.getDateByPosition(event.x + event.width)));
+            const newLeft = columnService.getPositionByDate(newFrom) | 0;
+            const newRight = columnService.getPositionByDate(newTo) | 0;
 
-            return {
-                destroy: () => selectionManager.taskSettings.delete(model.id.toString())
+            const targetRow = $rowStore.entities[model.resourceId];
+            const left = newLeft;
+            const width = newRight - newLeft;
+            const top = $rowPadding + targetRow.y;
+
+            updatePosition(left, top + topDelta, width);
+
+            const newTask = {
+                ...task,
+                left: left,
+                width: width,
+                top: top,
+                model
             };
+
+            const changed =
+                prevFrom != newFrom ||
+                prevTo != newTo ||
+                (sourceRow && sourceRow.model.id !== targetRow.model.id);
+            if (changed) {
+                api.tasks.raise.change({ task: newTask, sourceRow, targetRow, previousState });
+            }
+
+            if (changed) {
+                api.tasks.raise.changed({ task: newTask, sourceRow, targetRow, previousState });
+            }
+            taskStore.update(newTask);
         }
+
+        const draggable = useDraggable(node, {
+            container: rowContainer,
+            resizeHandleWidth,
+            getX: () => _position.x,
+            getY: () => _position.y,
+            getWidth: () => _position.width,
+            dragAllowed() {
+                return (
+                    $rowStore.entities[model.resourceId].model.enableDragging &&
+                    model.enableDragging
+                );
+            },
+            resizeAllowed() {
+                return (
+                    model.type !== 'milestone' &&
+                    $rowStore.entities[model.resourceId].model.enableResize &&
+                    model.enableResize
+                );
+            },
+            onDown(event) {
+                let draggingTasks: SvelteTask[] = [];
+                for (const [taskId, isSelected] of Object.entries($selectedTasks)) {
+                    if (isSelected && taskId !== model.id + '') {
+                        draggingTasks.push($taskStore.entities[taskId]);
+                    }
+                }
+
+                draggingContext.save(event, draggingTasks);
+
+                mainContainerRect = mainContainer.getBoundingClientRect();
+                if (event.dragging) {
+                    setCursor('move');
+                }
+                if (event.resizing) {
+                    setCursor('e-resize');
+                }
+                $draggingTaskCache[model.id] = true;
+            },
+            onMouseUp() {
+                setCursor('default');
+                api.tasks.raise.moveEnd(model);
+            },
+            onResize(event) {
+                _position.x = event.x;
+                _position.width = event.width;
+                _resizing = true;
+                _ignoreClick = true;
+                draggingContext.moveAll(event);
+                scrollIfOutOfBounds(event.event);
+            },
+            onDrag(event) {
+                _position.x = event.x;
+                _position.y = event.y;
+                _dragging = true;
+                _ignoreClick = true;
+                api.tasks.raise.move(model);
+                draggingContext.moveAll(event);
+                scrollIfOutOfBounds(event.event);
+            },
+            onDrop(event) {
+                onDrop(event);
+                draggingContext.dropAll(event);
+            }
+        });
+
+        return {
+            destroy: () => {
+                draggingContext.off(model.id);
+                draggable.destroy();
+            }
+        };
     }
 
     function taskElement(node, model) {
@@ -273,7 +276,35 @@
 
     let resizeEnabled: boolean;
     $: {
-        resizeEnabled = model.type !== 'milestone' && $rowStore.entities[model.resourceId].model.enableDragging && model.enableDragging;
+        resizeEnabled =
+            model.type !== 'milestone' &&
+            $rowStore.entities[model.resourceId].model.enableResize &&
+            model.enableResize;
+    }
+
+    let _height: number;
+    $: {
+        if (height !== undefined && $layout !== 'overlap') {
+            _height = height;
+        } else {
+            _height = $rowStore.entities[model.resourceId].height - 2 * $rowPadding;
+        }
+    }
+
+    let _top: number;
+    $: {
+        if (top !== undefined && $layout !== 'overlap') {
+            _top = _position.y;
+        } else if (_dragging || _resizing || ($selectedTasks[model.id] && $draggingActive)) {
+            _top = _position.y;
+        } else {
+            _top = $rowStore.entities[model.resourceId].y + $rowPadding;
+        }
+    }
+
+    let _moving: boolean;
+    $: {
+        _moving = _dragging || _resizing || ($selectedTasks[model.id] && $draggingActive);
     }
 </script>
 
@@ -283,13 +314,14 @@
     use:taskElement={model}
     class="sg-task {classes}"
     class:sg-milestone={model.type === 'milestone'}
-    style="width:{_position.width}px; height:{height}px; left: {_position.x}px; top: {_position.y}px;"
-    class:moving={_dragging || _resizing}
+    style="width:{_position.width}px; height:{_height}px; left: {_position.x}px; top: {_top}px;"
+    class:moving={_moving}
     class:animating
     class:sg-task-reflected={reflected}
     class:sg-task-selected={$selectedTasks[model.id]}
     class:resize-enabled={resizeEnabled}
     class:sg-task--sticky={model.stickyLabel}
+    class:sg-ignore-click={_ignoreClick}
 >
     {#if model.type === 'milestone'}
         <div class="sg-milestone__diamond"></div>
@@ -308,15 +340,19 @@
         <!-- <span class="debug">x:{_position.x} y:{_position.y}, x:{left} y:{top}</span> -->
         {#if model.showButton}
             <!-- svelte-ignore a11y-click-events-have-key-events -->
-            <span class="sg-task-button {model.buttonClasses}" on:click={onClick} role="button" tabindex="0">
+            <span
+                class="sg-task-button {model.buttonClasses}"
+                on:click={onClick}
+                role="button"
+                tabindex="0"
+            >
                 {@html model.buttonHtml}
             </span>
         {/if}
     </div>
 
     {#if model.labelBottom}
-        <!-- svelte-ignore a11y-label-has-associated-control -->
-        <label class="sg-label-bottom">{model.labelBottom}</label>
+        <span class="sg-label-bottom">{model.labelBottom}</span>
     {/if}
 </div>
 
@@ -341,7 +377,7 @@
 
         white-space: nowrap;
         /* overflow: hidden; */
-        
+
         transition:
             background-color 0.2s,
             opacity 0.2s;
@@ -369,19 +405,21 @@
 
     .sg-task:not(.moving) {
         transition:
-            left 0.2s, top 0.2s,
+            left 0.2s,
+            top 0.2s,
             transform 0.2s,
             background-color 0.2s,
-            width 0.2s, 
+            width 0.2s,
             height 0.2s;
     }
 
     .sg-task--sticky:not(.moving) {
         transition:
-            left 0.2s, top 0.2s,
+            left 0.2s,
+            top 0.2s,
             transform 0.2s,
             background-color 0.2s,
-            width 0.2s, 
+            width 0.2s,
             height 0.2s;
     }
 
